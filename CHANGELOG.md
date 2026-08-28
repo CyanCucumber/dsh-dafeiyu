@@ -5,6 +5,8 @@
 ### Added
 
 - Display the reasoning effort that DSH actually applies to each request in the companion status detail, and keep it visible as the task moves between thinking, tool use, and waiting states.
+- Double-clicking the BigFish now queries the DeepSeek API balance and shows the remaining amount in the status bubble (toggleable).
+- Sandbox permission prompts now play a dedicated attention chime, and when enabled the pet answers them directly with an on-pet 是/否 dialog instead of the WebUI card (both toggleable).
 
 ## 0.1.5
 

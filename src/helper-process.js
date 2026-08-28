@@ -253,6 +253,10 @@ export class HelperProcess {
       this.#clearHeartbeat()
       this.#clearStartupTimer()
       if (!this.stopping && !this.restartSuppressed) {
+        // The pet left while the host still wants it. Any pending host-side
+        // work that depends on the pet (e.g. an approval it claimed) must
+        // fall back now instead of waiting forever for a dead window.
+        this.options.onDisconnect?.('exit')
         if (!wasReady) {
           // The helper never became ready during this attempt (crashed before
           // READY or timed out). Count it as a failed start so a broken
@@ -393,10 +397,36 @@ export class HelperProcess {
       }
       if (reply?.protocolVersion === 1 && reply.kind === CompanionMessageKind.CLOSED) {
         this.restartSuppressed = true
+        this.options.onDisconnect?.('closed')
         return
       }
       if (reply?.protocolVersion === 1 && reply.kind === CompanionMessageKind.SETTINGS) {
         this.options.onSettingsChange?.(reply)
+        return
+      }
+      if (reply?.protocolVersion === 1 && reply.kind === 'balance-request') {
+        const handler = this.options.onBalanceRequest
+        const respond = (payload) => this.send(createMessage(CompanionMessageKind.BALANCE, payload))
+        if (typeof handler !== 'function') {
+          respond({ status: 'error', message: '余额查询失败', detail: '插件未提供余额查询' })
+          return
+        }
+        Promise.resolve()
+          .then(() => handler(reply))
+          .then((payload) => respond(payload && typeof payload === 'object' ? payload : {
+            status: 'error',
+            message: '余额查询失败',
+            detail: '插件返回了无效结果',
+          }))
+          .catch((error) => respond({
+            status: 'error',
+            message: '余额查询失败',
+            detail: error instanceof Error ? error.message : String(error),
+          }))
+        return
+      }
+      if (reply?.protocolVersion === 1 && reply.kind === 'approval-decision') {
+        this.options.onApprovalDecision?.(reply)
         return
       }
     } catch {

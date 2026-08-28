@@ -1,6 +1,7 @@
 import { createRequire } from 'node:module'
 import Schema from '@deepseek-ai/schemastery'
 import { CompanionReducer } from './companion-reducer.js'
+import { fetchDeepSeekBalance } from './deepseek-balance.js'
 import { HelperProcess } from './helper-process.js'
 import {
   CompanionMessageKind,
@@ -36,6 +37,9 @@ export const Config = Schema.object({
   ]).default('always').description('气泡显示模式'),
   bubbleStates: Schema.array(Schema.string()).default(['SUCCESS', 'ERROR', 'WAITING']).description('自定义模式下显示气泡的状态'),
   includeSubagents: Schema.boolean().default(false).description('允许子 Agent 抢占宠物状态'),
+  balanceOnDoubleClick: Schema.boolean().default(true).description('双击大肥鱼查询 API 余额'),
+  approvalSound: Schema.boolean().default(true).description('权限沙盒拦截时播放提示音'),
+  approvalOnPet: Schema.boolean().default(true).description('通过大肥鱼对话框应答权限（是/否）'),
 }).description('由 DeepSeek Harness 状态驱动的桌面大肥鱼伴侣')
 
 const defaults = Object.freeze({
@@ -48,6 +52,9 @@ const defaults = Object.freeze({
   bubbleMode: 'always',
   bubbleStates: ['SUCCESS', 'ERROR', 'WAITING'],
   includeSubagents: false,
+  balanceOnDoubleClick: true,
+  approvalSound: true,
+  approvalOnPet: true,
 })
 
 function publicConfig(config = {}) {
@@ -61,6 +68,9 @@ function publicConfig(config = {}) {
     bubbleMode: config.bubbleMode ?? defaults.bubbleMode,
     bubbleStates: Array.isArray(config.bubbleStates) ? config.bubbleStates : defaults.bubbleStates,
     includeSubagents: config.includeSubagents ?? defaults.includeSubagents,
+    balanceOnDoubleClick: config.balanceOnDoubleClick ?? defaults.balanceOnDoubleClick,
+    approvalSound: config.approvalSound ?? defaults.approvalSound,
+    approvalOnPet: config.approvalOnPet ?? defaults.approvalOnPet,
   }
 }
 
@@ -83,6 +93,33 @@ function jsonResponse(res, status, body) {
 
 function isLoopback(address) {
   return address === '127.0.0.1' || address === '::1' || address === '::ffff:127.0.0.1'
+}
+
+// How long the pet may hold an approval dialog before the ask lapses. The
+// host's own WebUI approval card waits forever, but a desktop dialog that the
+// user walked away from must not block the agent indefinitely.
+const APPROVAL_WAIT_TIMEOUT_MS = 10 * 60 * 1000
+
+// Find the newest undecided `approval/asked` event in a session log that this
+// plugin has not claimed yet. The approval id is not part of the waterfall
+// request object, so the claim must be reconciled against the durable log the
+// same way the host's api-proxy does it.
+function findUndecidedApprovalId(events, callId, pending) {
+  if (!Array.isArray(events)) return undefined
+  const decided = new Set()
+  const expectedCallId = callId ?? null
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index]
+    if (event?.type === 'approval/decided') {
+      decided.add(String(event.data?.id ?? ''))
+    } else if (event?.type === 'approval/asked') {
+      const id = String(event.data?.id ?? '')
+      if (!id || decided.has(id) || pending.has(id)) continue
+      if (expectedCallId !== (event.data?.callId ?? null)) continue
+      return id
+    }
+  }
+  return undefined
 }
 
 async function readPatch(req) {
@@ -144,7 +181,36 @@ function mount(ctx, config = {}, eventCtx = ctx) {
   let reducer
   let restartTimer
 
+  // Approvals the pet has claimed through the `approval/request` waterfall.
+  // Each entry resolves the claim promise when the pet answers, the ask is
+  // aborted, or the claim lapses. `fallback` hands unclaimed asks back to the
+  // host's own WebUI channel by resolving the waterfall promise closed.
+  const pendingApprovals = new Map()
+
+  const settleApproval = (entry, outcome) => {
+    if (entry.settled) return
+    entry.settled = true
+    pendingApprovals.delete(entry.id)
+    if (entry.timer) {
+      clearTimeout(entry.timer)
+      entry.timer = undefined
+    }
+    entry.cleanup?.()
+    entry.resolve(outcome)
+  }
+
+  const fallbackPendingApprovals = (reason) => {
+    if (pendingApprovals.size === 0) return
+    for (const entry of [...pendingApprovals.values()]) {
+      settleApproval(entry, 'unavailable')
+      logger.warn?.(`dsh-dafeiyu approval ${entry.id} fell back to unavailable (${reason})`)
+    }
+  }
+
   const stopRuntime = (reason = 'settings-change') => {
+    // Pending asks the pet was holding must not hang the agent after the pet
+    // goes away: fail them closed instead of waiting forever.
+    fallbackPendingApprovals(reason)
     bridge?.stop(reason)
     bridge = undefined
     reducer = undefined
@@ -157,6 +223,8 @@ function mount(ctx, config = {}, eventCtx = ctx) {
 
   const applyLiveSettings = (next) => {
     for (const message of reducer.setIncludeSubagents(next.includeSubagents === true)) bridge.send(message)
+    for (const message of reducer.setApprovalAnswerable(next.approvalOnPet === true)) bridge.send(message)
+    if (next.approvalOnPet !== true) fallbackPendingApprovals('approval-on-pet-disabled')
     bridge.send(createMessage(CompanionMessageKind.CONFIG, {
       scale: next.scale ?? defaults.scale,
       bubbleScale: next.bubbleScale ?? defaults.bubbleScale,
@@ -165,6 +233,9 @@ function mount(ctx, config = {}, eventCtx = ctx) {
       soundEnabled: next.soundEnabled !== false,
       bubbleMode: next.bubbleMode ?? defaults.bubbleMode,
       bubbleStates: Array.isArray(next.bubbleStates) ? next.bubbleStates : defaults.bubbleStates,
+      balanceOnDoubleClick: next.balanceOnDoubleClick !== false,
+      approvalSound: next.approvalSound !== false,
+      approvalOnPet: next.approvalOnPet === true,
     }))
   }
 
@@ -195,6 +266,9 @@ function mount(ctx, config = {}, eventCtx = ctx) {
         DSH_DAFEIYU_BUBBLE_MODE: String(resolved.bubbleMode ?? defaults.bubbleMode),
         DSH_DAFEIYU_BUBBLE_STATES: (Array.isArray(resolved.bubbleStates) ? resolved.bubbleStates : defaults.bubbleStates).join(','),
         DSH_DAFEIYU_WEBUI_URL: String(config.webuiUrl ?? process.env.DSH_DAFEIYU_WEBUI_URL ?? 'http://127.0.0.1:3080/'),
+        DSH_DAFEIYU_BALANCE_ON_DBLCLICK: resolved.balanceOnDoubleClick !== false ? '1' : '0',
+        DSH_DAFEIYU_APPROVAL_SOUND: resolved.approvalSound !== false ? '1' : '0',
+        DSH_DAFEIYU_APPROVAL_ON_PET: resolved.approvalOnPet === true ? '1' : '0',
       },
       onSettingsChange: (report) => {
         if (typeof settings.update !== 'function') return
@@ -207,8 +281,24 @@ function mount(ctx, config = {}, eventCtx = ctx) {
           logger.warn?.(`dsh-dafeiyu failed to persist helper settings: ${error instanceof Error ? error.message : String(error)}`)
         })
       },
+      onBalanceRequest: () => fetchDeepSeekBalance(ctx, logger),
+      onApprovalDecision: (reply) => {
+        const id = String(reply?.approvalId ?? '')
+        const entry = id ? pendingApprovals.get(id) : undefined
+        if (!entry || entry.settled) {
+          if (id) logger.debug?.(`dsh-dafeiyu approval decision arrived for unknown id ${id}`)
+          return
+        }
+        const outcome = reply?.decision === 'yes' ? 'allowed-once' : 'rejected'
+        settleApproval(entry, outcome)
+        logger.debug?.(`dsh-dafeiyu approval ${id} decided by the pet: ${outcome}`)
+      },
+      onDisconnect: (reason) => fallbackPendingApprovals(`pet-disconnect:${reason}`),
     }, logger)
-    reducer = new CompanionReducer({ includeSubagents: resolved.includeSubagents === true })
+    reducer = new CompanionReducer({
+      includeSubagents: resolved.includeSubagents === true,
+      approvalAnswerable: resolved.approvalOnPet === true,
+    })
     bridge.start()
     bridge.send(createMessage(CompanionMessageKind.HELLO, {
       state: CompanionState.IDLE,
@@ -252,6 +342,44 @@ function mount(ctx, config = {}, eventCtx = ctx) {
     }
   }, { global: true })
 
+  // Answer sandbox escalation asks from the desktop pet. This listener runs
+  // BEFORE the host's api-proxy listener (prepend), so when the pet feature is
+  // enabled the pet's yes/no dialog is the approval channel; when it is
+  // disabled (or the helper is down) the ask passes straight through to the
+  // WebUI. The claim promise resolves with the pet's decision, an abort, a
+  // lapse, or a fail-closed fallback when the pet disappears.
+  const offApprovalRequest = eventCtx.on('approval/request', (req, next) => {
+    // The pet must be alive to answer: `bridge.spawned` is false after the
+    // user closes the window (本次关闭), after a crash, and before READY, so
+    // those asks pass straight through to the WebUI channel.
+    if (!bridge || !bridge.spawned || settings.get()?.approvalOnPet !== true) return next()
+    let approvalId
+    try {
+      approvalId = findUndecidedApprovalId(req?.agent?.session?.events, req?.callId, pendingApprovals)
+    } catch (error) {
+      logger.error?.('dsh-dafeiyu failed to inspect approval request', error)
+      return next()
+    }
+    if (!approvalId) return next()
+    return new Promise((resolve) => {
+      const entry = { id: approvalId, resolve, settled: false, timer: undefined, cleanup: undefined }
+      pendingApprovals.set(approvalId, entry)
+      const onAbort = () => settleApproval(entry, 'cancelled')
+      if (req.signal?.aborted === true) {
+        settleApproval(entry, 'cancelled')
+        return
+      }
+      req.signal?.addEventListener('abort', onAbort, { once: true })
+      entry.cleanup = () => req.signal?.removeEventListener('abort', onAbort)
+      entry.timer = setTimeout(() => {
+        entry.timer = undefined
+        settleApproval(entry, 'unavailable')
+        logger.warn?.(`dsh-dafeiyu approval ${approvalId} timed out without an answer`)
+      }, APPROVAL_WAIT_TIMEOUT_MS)
+      entry.timer.unref?.()
+    })
+  }, { global: true, prepend: true })
+
   const unwatch = settings.watch((next) => {
     // Disabling is the only path that tears the helper down.  Every other
     // setting is applied live through a CONFIG message, so sliders never
@@ -288,6 +416,7 @@ function mount(ctx, config = {}, eventCtx = ctx) {
     restartTimer = undefined
     offEvent?.()
     offDisposed?.()
+    offApprovalRequest?.()
     unwatch()
     stopRuntime('dsh-host-stop')
   })
@@ -306,4 +435,5 @@ export {
   CompanionReducer,
   CompanionState,
   HelperProcess,
+  findUndecidedApprovalId,
 }

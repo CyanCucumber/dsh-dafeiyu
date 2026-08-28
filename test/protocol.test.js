@@ -54,3 +54,25 @@ test('protocol accepts settings reported by the desktop helper', () => {
   assert.equal(assertCompanionMessage(message), message)
   assert.deepEqual(JSON.parse(encodeMessage(message)), message)
 })
+
+test('protocol creates and encodes an API balance message', () => {
+  const message = createMessage(CompanionMessageKind.BALANCE, {
+    status: 'ok',
+    message: 'API 余额',
+    detail: '总余额 ¥110.00（充值 ¥100.00 + 赠送 ¥10.00）',
+  })
+  assert.equal(assertCompanionMessage(message), message)
+  assert.deepEqual(JSON.parse(encodeMessage(message)), message)
+})
+
+test('protocol creates and encodes an approval prompt message', () => {
+  const message = createMessage(CompanionMessageKind.APPROVAL, {
+    approvalId: 'approval-1',
+    toolName: 'bash',
+    reason: 'escalate sandbox to danger-full-access',
+    sessionId: 'session-main',
+    answerable: true,
+  })
+  assert.equal(assertCompanionMessage(message), message)
+  assert.deepEqual(JSON.parse(encodeMessage(message)), message)
+})

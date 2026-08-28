@@ -282,13 +282,17 @@ DSH Agent events can change its work state.
 | Reduced motion | Reduce walking, looping frames, and procedural movement |
 | Notification sound | Play or mute BigFish's original sound when a task succeeds or fails |
 | Include subagents | Allow subagent sessions to participate in status priority; off by default |
+| Balance on double-click | Query and show the remaining DeepSeek API balance in the bubble when BigFish is double-clicked |
+| Approval chime | Play an attention sound when a sandbox permission prompt appears |
+| Answer approvals on pet | Answer sandbox permission prompts with an on-pet 是/否 dialog |
 
 DSH persists these settings, so a normal plugin update does not require reconfiguration.
 
 ## Desktop interactions
 
 - **Drag:** move BigFish; its position is saved automatically.
-- **Click or double-click:** trigger brief head-pat, poke, or tail reactions, then return to the latest DSH state.
+- **Click or double-click:** trigger brief head-pat, poke, or tail reactions, then return to the latest DSH state. With "Balance on double-click" enabled, double-click queries and displays the remaining API balance instead.
+- **Permission dialog:** when a sandbox permission prompt appears, BigFish pops up a dialog with 允许 (allow) / 拒绝 (reject) buttons (needs "Answer approvals on pet") and plays a chime to draw attention.
 - **Right-click:** change size, bubble size, reduce motion, open WebUI, hide for now, or close for this run.
 - **Hide for now:** hides the window without disabling the plugin.
 - **Close for this run:** closes the current Helper and suppresses restart until the next DSH launch.

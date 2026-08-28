@@ -156,8 +156,9 @@ function detailFor(record, stage = record.payload.stage) {
 }
 
 export class CompanionReducer {
-  constructor({ includeSubagents = false, maxSessions = 256 } = {}) {
+  constructor({ includeSubagents = false, approvalAnswerable = false, maxSessions = 256 } = {}) {
     this.includeSubagents = includeSubagents
+    this.approvalAnswerable = approvalAnswerable === true
     this.sessions = new Map()
     this.maxSessions = maxSessions
     this.clock = 0
@@ -176,6 +177,14 @@ export class CompanionReducer {
       }
     }
     return this.#render()
+  }
+
+  // Whether the desktop pet should render an answerable yes/no dialog for the
+  // next approval. The pet can still be told about approvals (to play a sound)
+  // when this is false; only the interactive dialog is suppressed.
+  setApprovalAnswerable(value) {
+    this.approvalAnswerable = value === true
+    return []
   }
 
   handle(session, event) {
@@ -271,7 +280,16 @@ export class CompanionReducer {
           toolName,
           message: statusCopy('approval', event.seq),
         })
-        return this.#render()
+        const messages = this.#render()
+        messages.push(createMessage(CompanionMessageKind.APPROVAL, {
+          approvalId: id,
+          toolName,
+          ...(event.data?.callId !== undefined ? { callId: String(event.data.callId) } : {}),
+          ...(event.data?.reason !== undefined ? { reason: String(event.data.reason) } : {}),
+          sessionId: record.id,
+          answerable: this.approvalAnswerable === true,
+        }))
+        return messages
       }
 
       case 'approval/decided':
@@ -306,9 +324,15 @@ export class CompanionReducer {
 
   #approvalDecided(record, event) {
     const id = String(event.data?.id ?? '')
-    if (!record.waitingApprovalId || id !== record.waitingApprovalId) return []
+    // Always tell the pet to dismiss a dialog for this id, even when the ask
+    // was answered through another channel (e.g. the WebUI after the pet's
+    // claim lapsed).
+    const clear = createMessage(CompanionMessageKind.APPROVAL, { approvalId: id, active: false })
+    if (!record.waitingApprovalId || id !== record.waitingApprovalId) {
+      return id ? [clear] : []
+    }
     record.waitingApprovalId = undefined
-    return this.#resumeAfterTool(record, event)
+    return [...this.#resumeAfterTool(record, event), clear]
   }
 
   #resumeAfterTool(record, event) {

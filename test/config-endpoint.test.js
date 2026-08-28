@@ -5,7 +5,18 @@ import test from 'node:test'
 import { createConfigHandler } from '../src/index.js'
 
 function settingsFixture() {
-  let value = { enabled: true, scale: 1, bubbleScale: 1, activityLevel: 'normal', reducedMotion: false, soundEnabled: true, includeSubagents: false }
+  let value = {
+    enabled: true,
+    scale: 1,
+    bubbleScale: 1,
+    activityLevel: 'normal',
+    reducedMotion: false,
+    soundEnabled: true,
+    includeSubagents: false,
+    balanceOnDoubleClick: true,
+    approvalSound: true,
+    approvalOnPet: true,
+  }
   return {
     get: () => ({ ...value }),
     update: async (patch) => { value = { ...value, ...patch } },
@@ -51,6 +62,20 @@ test('local config endpoint rejects remote, cross-origin, and unknown writes', a
   assert.equal((await request(handler, { address: '192.168.1.8' })).status, 403)
   assert.equal((await request(handler, { origin: 'https://example.com' })).status, 403)
   assert.equal((await request(handler, { method: 'PATCH', body: '{"surprise":true}' })).status, 400)
+})
+
+test('local config endpoint persists the pet feature toggles', async () => {
+  const settings = settingsFixture()
+  const handler = createConfigHandler(settings)
+  const changed = await request(handler, {
+    method: 'PATCH',
+    body: JSON.stringify({ balanceOnDoubleClick: false, approvalSound: false, approvalOnPet: false }),
+    origin: 'http://127.0.0.1:2026',
+  })
+  assert.equal(changed.status, 200)
+  assert.equal(changed.body.balanceOnDoubleClick, false)
+  assert.equal(changed.body.approvalSound, false)
+  assert.equal(changed.body.approvalOnPet, false)
 })
 
 test('settings client debounces each slider independently', async () => {

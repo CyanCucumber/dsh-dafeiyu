@@ -125,7 +125,7 @@ def run_headless(recorder: EventRecorder) -> int:
 def run_visual(recorder: EventRecorder, snapshot_path: Path | None = None) -> int:
     configure_qt_platform()
     try:
-        from PySide6.QtCore import QObject, QPoint, QRectF, Qt, QTimer, QUrl, Signal
+        from PySide6.QtCore import QObject, QPoint, QPointF, QRectF, Qt, QTimer, QUrl, Signal
         from PySide6.QtGui import QColor, QDesktopServices, QFont, QFontMetrics, QMouseEvent, QPainter, QPen, QPixmap
         from PySide6.QtWidgets import QApplication, QMenu, QWidget
     except ImportError:
@@ -186,6 +186,12 @@ def run_visual(recorder: EventRecorder, snapshot_path: Path | None = None) -> in
             )
             configured_sound_enabled = os.environ.get("DSH_DAFEIYU_SOUND_ENABLED")
             self.sound_enabled = configured_sound_enabled != "0"
+            configured_balance_on_dblclick = os.environ.get("DSH_DAFEIYU_BALANCE_ON_DBLCLICK")
+            self.balance_on_dblclick = configured_balance_on_dblclick != "0"
+            configured_approval_sound = os.environ.get("DSH_DAFEIYU_APPROVAL_SOUND")
+            self.approval_sound = configured_approval_sound != "0"
+            configured_approval_on_pet = os.environ.get("DSH_DAFEIYU_APPROVAL_ON_PET")
+            self.approval_on_pet = configured_approval_on_pet == "1"
             self.activity_level = os.environ.get("DSH_DAFEIYU_ACTIVITY_LEVEL", "normal")
             configured_bubble_mode = os.environ.get("DSH_DAFEIYU_BUBBLE_MODE")
             self.bubble_mode = (
@@ -218,6 +224,11 @@ def run_visual(recorder: EventRecorder, snapshot_path: Path | None = None) -> in
             self.overlay_message = ""
             self.overlay_detail = ""
             self.overlay_deadline_ms: int | None = None
+            # Pending sandbox permission prompt shown as an answerable dialog.
+            self.approval: dict[str, Any] | None = None
+            self.approval_card_rect: QRectF | None = None
+            self.approval_yes_rect: QRectF | None = None
+            self.approval_no_rect: QRectF | None = None
             self.task = ""
             self.tasks: list[dict[str, Any]] = []
             self.webui_url = os.environ.get("DSH_DAFEIYU_WEBUI_URL", "http://127.0.0.1:3080/")
@@ -274,6 +285,10 @@ def run_visual(recorder: EventRecorder, snapshot_path: Path | None = None) -> in
                 self._sync_bubble_size()
             elif kind == "config":
                 self._apply_config(message)
+            elif kind == "balance":
+                self._apply_balance(message)
+            elif kind == "approval":
+                self._apply_approval(message)
             elif kind in {"state", "pulse"}:
                 state = str(message.get("state", "IDLE"))
                 self.display_state = state
@@ -348,6 +363,17 @@ def run_visual(recorder: EventRecorder, snapshot_path: Path | None = None) -> in
             bubble_states = message.get("bubbleStates")
             if isinstance(bubble_states, list):
                 self.bubble_states = [str(state) for state in bubble_states if isinstance(state, str)]
+            balance_on_dblclick = message.get("balanceOnDoubleClick")
+            if isinstance(balance_on_dblclick, bool):
+                self.balance_on_dblclick = balance_on_dblclick
+            approval_sound = message.get("approvalSound")
+            if isinstance(approval_sound, bool):
+                self.approval_sound = approval_sound
+            approval_on_pet = message.get("approvalOnPet")
+            if isinstance(approval_on_pet, bool):
+                self.approval_on_pet = approval_on_pet
+                if not approval_on_pet and self.approval is not None:
+                    self.approval = None
             self._sync_bubble_size()
             self._save_layout()
 
@@ -448,6 +474,10 @@ def run_visual(recorder: EventRecorder, snapshot_path: Path | None = None) -> in
             self.micro_timer.start(random.randint(lower, upper))
 
         def _bubble_visible(self) -> bool:
+            # An answerable approval dialog must stay visible even when the
+            # bubble mode would normally hide the status card.
+            if self.approval is not None:
+                return True
             if self.bubble_mode == "hidden":
                 return False
             if self.bubble_mode == "always":
@@ -611,6 +641,167 @@ def run_visual(recorder: EventRecorder, snapshot_path: Path | None = None) -> in
             self.overlay_state = None
             self.overlay_deadline_ms = None
 
+        def _apply_balance(self, message: dict[str, Any]) -> None:
+            """Show the DeepSeek API balance snapshot returned by the host."""
+            if message.get("status") == "ok":
+                self._show_overlay(
+                    str(message.get("message", "API 余额")),
+                    str(message.get("detail", "")),
+                    "SUCCESS",
+                    8000,
+                )
+            else:
+                self._show_overlay(
+                    str(message.get("message", "查询失败")),
+                    str(message.get("detail", "")),
+                    "ERROR",
+                    8000,
+                )
+
+        def _apply_approval(self, message: dict[str, Any]) -> None:
+            """Show (or dismiss) a sandbox permission prompt from the host."""
+            approval_id = str(message.get("approvalId", ""))
+            if not approval_id:
+                return
+            if message.get("active") is False:
+                if self.approval is not None and self.approval.get("approvalId") == approval_id:
+                    self.approval = None
+                    self._sync_bubble_size()
+                return
+            answerable = self.approval_on_pet and message.get("answerable") is True
+            if answerable:
+                self.approval = {
+                    "approvalId": approval_id,
+                    "toolName": str(message.get("toolName", "approval")),
+                    "reason": str(message.get("reason", "")),
+                    "sessionId": str(message.get("sessionId", "")),
+                    "answerable": True,
+                }
+            # Either way a sandbox permission prompt fired: draw attention so
+            # the user notices even when the WebUI is the answerer.
+            if self.sound_enabled and self.approval_sound:
+                self._notify_approval_sound()
+            self._sync_bubble_size()
+
+        def _request_balance(self) -> None:
+            """Double-click action: ask the host for the DeepSeek API balance."""
+            self._play_model_overlay("head_pat")
+            self._show_overlay("正在查询 API 余额…", "请稍等一会儿哦", "THINKING", 15000)
+            emit_reply("balance-request")
+
+        def _notify_approval_sound(self) -> None:
+            """Attention chime for a permission prompt, plus a window shake."""
+            played = False
+            if sys.platform == "win32":
+                try:
+                    import winsound
+
+                    sound_path = bundle_root() / "assets" / "sounds" / "approval.wav"
+                    if sound_path.exists():
+                        winsound.PlaySound(
+                            str(sound_path),
+                            winsound.SND_FILENAME | winsound.SND_ASYNC | winsound.SND_NODEFAULT,
+                        )
+                        played = True
+                except (ImportError, OSError, RuntimeError):
+                    pass
+            if not played:
+                try:
+                    QApplication.beep()
+                except Exception:
+                    pass
+            self._shake_window()
+
+        def _decide_approval(self, decision: str) -> None:
+            """Send the user's yes/no back to the host and dismiss the dialog."""
+            approval_id = self.approval.get("approvalId", "") if self.approval else ""
+            self.approval = None
+            self._sync_bubble_size()
+            emit_reply("approval-decision", approvalId=approval_id, decision=decision)
+            if decision == "yes":
+                self._show_overlay("好的，已允许这次操作", self.status_detail, "SUCCESS", 2400)
+            else:
+                self._show_overlay("已拒绝这次操作", self.status_detail, "ERROR", 2400)
+
+        def _handle_approval_click(self, x: float, y: float) -> bool:
+            """Consume clicks on the answerable approval dialog; buttons decide."""
+            if self.approval is None or not self.approval.get("answerable"):
+                return False
+            point = QPointF(x, y)
+            if self.approval_card_rect is None or not self.approval_card_rect.contains(point):
+                return False
+            if self.approval_yes_rect is not None and self.approval_yes_rect.contains(point):
+                self._decide_approval("yes")
+            elif self.approval_no_rect is not None and self.approval_no_rect.contains(point):
+                self._decide_approval("no")
+            return True
+
+        def _draw_approval_button(self, painter: QPainter, rect: QRectF, label: str, accent: QColor, s: float) -> None:
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor(17, 24, 39, 10))
+            painter.drawRoundedRect(rect.adjusted(0, round(2 * s), 0, 0), round(10 * s), round(10 * s))
+            painter.setBrush(QColor(247, 248, 250, 255))
+            painter.setPen(QPen(QColor(218, 221, 226, 205), 1))
+            painter.drawRoundedRect(rect, round(10 * s), round(10 * s))
+            font = QFont("Microsoft YaHei UI")
+            font.setPointSizeF(max(8.0, 9.5 * s))
+            font.setWeight(QFont.Weight.DemiBold)
+            painter.setFont(font)
+            painter.setPen(accent)
+            painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, label)
+
+        def _draw_approval_card(self, painter: QPainter, card_x: int, card_y: int, card_width: int, card_height: int, s: float) -> None:
+            """Render the pending-permission dialog with 是/否 buttons."""
+            self._draw_card_background(painter, card_x, card_y, card_width, card_height, round(30 * s), s)
+            title_font = QFont("Microsoft YaHei UI")
+            title_font.setPointSizeF(max(8.0, 11.0 * s))
+            title_font.setWeight(QFont.Weight.DemiBold)
+            detail_font = QFont("Microsoft YaHei UI")
+            detail_font.setPointSizeF(max(7.0, 9.0 * s))
+            text_x = card_x + round(18 * s)
+            text_width = max(40, card_width - round(36 * s))
+            painter.setFont(title_font)
+            painter.setPen(QColor("#25282D"))
+            painter.drawText(
+                text_x,
+                card_y + round(12 * s),
+                text_width,
+                max(12, round(24 * s)),
+                Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                "需要你的批准",
+            )
+            painter.setFont(detail_font)
+            painter.setPen(QColor("#747981"))
+            tool_line = f"工具：{self.approval.get('toolName', 'approval')}"
+            painter.drawText(
+                text_x,
+                card_y + round(38 * s),
+                text_width,
+                max(12, round(20 * s)),
+                Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                QFontMetrics(detail_font).elidedText(tool_line, Qt.TextElideMode.ElideRight, text_width),
+            )
+            reason = str(self.approval.get("reason", "")) or "该操作需要你确认是否允许"
+            painter.drawText(
+                text_x,
+                card_y + round(58 * s),
+                text_width,
+                max(12, round(20 * s)),
+                Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                QFontMetrics(detail_font).elidedText(reason, Qt.TextElideMode.ElideRight, text_width),
+            )
+            button_y = card_y + round(84 * s)
+            button_height = round(30 * s)
+            gap = round(12 * s)
+            button_width = max(56, (card_width - round(36 * s) - gap) // 2)
+            yes_x = card_x + round(18 * s)
+            no_x = yes_x + button_width + gap
+            self.approval_yes_rect = QRectF(yes_x, button_y, button_width, button_height)
+            self.approval_no_rect = QRectF(no_x, button_y, button_width, button_height)
+            self.approval_card_rect = QRectF(card_x, card_y, card_width, card_height)
+            self._draw_approval_button(painter, self.approval_yes_rect, "允许", QColor("#12B85A"), s)
+            self._draw_approval_button(painter, self.approval_no_rect, "拒绝", QColor("#E5484D"), s)
+
         @staticmethod
         def _now_ms() -> int:
             return int(time.monotonic() * 1000)
@@ -670,6 +861,8 @@ def run_visual(recorder: EventRecorder, snapshot_path: Path | None = None) -> in
                 painter.drawEllipse(center_x - 5, center_y - 5, 10, 10)
 
         def _card_height(self) -> int:
+            if self.approval is not None:
+                return round(122 * self.bubble_scale)
             if len(self.tasks) >= 2:
                 rows = min(len(self.tasks), 3)
                 return round((58 + rows * 26) * self.bubble_scale)
@@ -817,7 +1010,10 @@ def run_visual(recorder: EventRecorder, snapshot_path: Path | None = None) -> in
             s = self.bubble_scale
             corner_radius = round(30 * s)
 
-            if len(self.tasks) >= 2 and self._bubble_visible():
+            if self.approval is not None:
+                bubble_height = card_y + card_height + 19
+                self._draw_approval_card(painter, card_x, card_y, card_width, card_height, s)
+            elif len(self.tasks) >= 2 and self._bubble_visible():
                 bubble_height = card_y + card_height + 19
                 self._draw_card_background(painter, card_x, card_y, card_width, card_height, corner_radius, s)
                 self._draw_multi_task_card(painter, card_x, card_y, card_width, card_height, s)
@@ -947,6 +1143,17 @@ def run_visual(recorder: EventRecorder, snapshot_path: Path | None = None) -> in
 
         def mousePressEvent(self, event: QMouseEvent) -> None:
             if event.button() == Qt.MouseButton.LeftButton:
+                # Pressing inside the approval dialog must not start a drag:
+                # the dialog is interactive, not part of the draggable pet.
+                if (
+                    self.approval is not None
+                    and self.approval_card_rect is not None
+                    and self.approval_card_rect.contains(event.position())
+                ):
+                    self.drag_origin = None
+                    self.pet_origin = None
+                    self.dragging = False
+                    return
                 self.drag_origin = event.globalPosition().toPoint()
                 self.pet_origin = QPoint(self.pet_x, self.pet_y)
                 self.dragging = False
@@ -964,7 +1171,7 @@ def run_visual(recorder: EventRecorder, snapshot_path: Path | None = None) -> in
                     self._finish_drag()
                     self._move_to_pet(self.pet_x, self.pet_y)
                     self._save_layout()
-                else:
+                elif not self._handle_approval_click(event.position().x(), event.position().y()):
                     self._play_click_interaction(event.position().x(), event.position().y())
             self.drag_origin = None
             self.pet_origin = None
@@ -986,8 +1193,13 @@ def run_visual(recorder: EventRecorder, snapshot_path: Path | None = None) -> in
 
         def mouseDoubleClickEvent(self, event: QMouseEvent) -> None:
             if event.button() == Qt.MouseButton.LeftButton:
-                self._play_model_overlay("head_pat")
-                self._show_overlay("好啦好啦，知道你喜欢我~", self.status_detail, self.status_state, 1800)
+                if self.approval is not None:
+                    return
+                if self.balance_on_dblclick:
+                    self._request_balance()
+                else:
+                    self._play_model_overlay("head_pat")
+                    self._show_overlay("好啦好啦，知道你喜欢我~", self.status_detail, self.status_state, 1800)
 
         def contextMenuEvent(self, event: Any) -> None:
             menu = QMenu(self)

@@ -108,3 +108,42 @@ test('desktop context-menu settings reach the host settings callback', async () 
   bridge.stop('settings-test-complete')
   await exited
 })
+
+test('pet balance requests receive a BALANCE reply from the host callback', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'dsh-dafeiyu-balance-'))
+  const received = join(directory, 'received.jsonl')
+  const fixture = join(dirname(fileURLToPath(import.meta.url)), 'fixtures', 'balance-helper.js')
+  const logger = { debug() {}, info() {}, warn() {}, error() {} }
+  const bridge = new HelperProcess({
+    command: process.execPath,
+    args: [fixture, received],
+    headless: false,
+    heartbeatMs: 0,
+    onBalanceRequest: () => ({
+      status: 'ok',
+      message: 'API 余额',
+      detail: '总余额 ¥110.00（充值 ¥100.00 + 赠送 ¥10.00）',
+    }),
+  }, logger)
+  bridge.start()
+  bridge.send(createMessage(CompanionMessageKind.STATE, {
+    state: CompanionState.WORKING,
+    message: 'wake the balance fixture',
+  }))
+  await waitFor(async () => {
+    try {
+      const lines = (await readFile(received, 'utf8')).trim().split(/\r?\n/).map(JSON.parse)
+      return lines.some((message) => message.kind === CompanionMessageKind.BALANCE)
+    } catch {
+      return false
+    }
+  })
+  const lines = (await readFile(received, 'utf8')).trim().split(/\r?\n/).map(JSON.parse)
+  const balance = lines.find((message) => message.kind === CompanionMessageKind.BALANCE)
+  assert.equal(balance.status, 'ok')
+  assert.equal(balance.message, 'API 余额')
+  assert.match(balance.detail, /总余额 ¥110\.00/u)
+  bridge.stop('balance-test-complete')
+  await waitFor(() => bridge.child === undefined)
+  await rm(directory, { recursive: true, force: true })
+})

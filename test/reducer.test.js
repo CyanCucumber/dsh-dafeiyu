@@ -231,16 +231,66 @@ test('approval events show waiting and resume after the decision', () => {
   assert.equal(asked.state, CompanionState.WAITING)
   assert.equal(asked.stage, '等待审批')
 
-  assert.deepEqual(reducer.handle(session, event('approval/decided', {
+  const unrelated = reducer.handle(session, event('approval/decided', {
     id: 'unrelated',
     outcome: 'granted',
-  }, 3)), [])
+  }, 3))
+  assert.equal(unrelated.length, 1)
+  assert.equal(unrelated[0].kind, CompanionMessageKind.APPROVAL)
+  assert.equal(unrelated[0].active, false)
 
   const [resumed] = reducer.handle(session, event('approval/decided', {
     id: 'approval-1',
     outcome: 'granted',
   }, 4))
   assert.equal(resumed.state, CompanionState.THINKING)
+})
+
+test('approval asks carry a prompt message and clear on decision', () => {
+  const reducer = new CompanionReducer()
+  reducer.handle(session, event('turn/start', { turn: 1 }, 1))
+
+  const messages = reducer.handle(session, event('approval/asked', {
+    id: 'approval-9',
+    toolName: 'bash',
+    callId: 'call-9',
+    reason: 'escalate sandbox',
+  }, 2))
+  const prompt = messages.find((message) => message.kind === CompanionMessageKind.APPROVAL)
+  assert.ok(prompt, 'approval/asked must emit an APPROVAL prompt message')
+  assert.equal(prompt.approvalId, 'approval-9')
+  assert.equal(prompt.toolName, 'bash')
+  assert.equal(prompt.callId, 'call-9')
+  assert.equal(prompt.reason, 'escalate sandbox')
+  assert.equal(prompt.sessionId, 'session-main')
+  assert.equal(prompt.answerable, false, 'the pet only answers when configured to')
+
+  const decided = reducer.handle(session, event('approval/decided', {
+    id: 'approval-9',
+    outcome: 'allowed-once',
+  }, 3))
+  const clear = decided.find((message) => message.kind === CompanionMessageKind.APPROVAL)
+  assert.ok(clear, 'approval/decided must emit an APPROVAL dismissal message')
+  assert.equal(clear.approvalId, 'approval-9')
+  assert.equal(clear.active, false)
+})
+
+test('approvalAnswerable flag drives the pet dialog affordance', () => {
+  const reducer = new CompanionReducer({ approvalAnswerable: true })
+  reducer.handle(session, event('turn/start', { turn: 1 }, 1))
+
+  const [prompt] = reducer.handle(session, event('approval/asked', {
+    id: 'approval-answerable',
+    toolName: 'bash',
+  }, 2)).filter((message) => message.kind === CompanionMessageKind.APPROVAL)
+  assert.equal(prompt.answerable, true)
+
+  assert.deepEqual(reducer.setApprovalAnswerable(false), [])
+  const [laterPrompt] = reducer.handle(session, event('approval/asked', {
+    id: 'approval-passive',
+    toolName: 'bash',
+  }, 3)).filter((message) => message.kind === CompanionMessageKind.APPROVAL)
+  assert.equal(laterPrompt.answerable, false)
 })
 
 test('tool categories keep renderer semantics independent from DSH tool names', () => {
